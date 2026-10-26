@@ -13,14 +13,19 @@ class RespuestaIa(val texto: String, val accion: String, val recordar: String?, 
 class ErrorIa(mensaje: String, val recuperable: Boolean = false) : Exception(mensaje)
 
 /**
- * Llama a la IA directo desde el teléfono con la clave que pegó el usuario.
- * La clave que empieza con «sk-ant-» usa Anthropic (Claude); la que empieza con «sk-» usa OpenAI (ChatGPT); cualquier otra usa Google (Gemini).
+ * Llama a la IA directo desde el teléfono con la clave que pegó el usuario. Detecta el proveedor así:
+ *  «sk-ant-» Claude · «nvapi-» NVIDIA (gratis) · «gsk_» Groq (gratis) · «sk-or-» OpenRouter · «xai-» Grok (xAI)
+ *  «sk-» con un modelo «deepseek-…» → DeepSeek · «sk-» → OpenAI (ChatGPT) · modelo «mistral-…» → Mistral
+ *  cualquier otra → Google (Gemini).
  * Errores temporales (500/502/503/504/529 y tiempos de espera) se reintentan hasta 2 veces con espera creciente.
  */
+class Proveedor(val nombre: String, val url: String, val modelo: String, val esOpenAI: Boolean = false)
+
 object AiClient {
     const val MODELO_POR_DEFECTO = "gemini-flash-latest"
     const val MODELO_CLAUDE = "claude-haiku-5-5"
     const val MODELO_OPENAI = "gpt-4o-mini"
+    const val MODELO_NVIDIA = "meta/llama-3.1-70b-instruct"
     private val ACCIONES = setOf("none", "follow", "stay", "jump", "go_home")
     private val EMOCIONES = setOf("calm", "happy", "sad", "angry", "crying", "surprised", "proud")
 
@@ -39,7 +44,31 @@ Formato: responde SOLO con un JSON en una línea: {"text":"...","action":"none",
 donde action es none, follow, stay, jump o go_home."""
 
     fun esClaude(clave: String): Boolean = clave.trim().startsWith("sk-ant-")
-    fun esOpenAI(clave: String): Boolean = clave.trim().startsWith("sk-") && !esClaude(clave)
+
+    private val NVIDIA = Proveedor("NVIDIA", "https://integrate.api.nvidia.com/v1/chat/completions", MODELO_NVIDIA)
+    private val GROQ = Proveedor("Groq", "https://api.groq.com/openai/v1/chat/completions", "llama-3.3-70b-versatile")
+    private val OPENROUTER = Proveedor("OpenRouter", "https://openrouter.ai/api/v1/chat/completions", "meta-llama/llama-3.3-70b-instruct:free")
+    private val XAI = Proveedor("xAI (Grok)", "https://api.x.ai/v1/chat/completions", "grok-3-mini")
+    private val DEEPSEEK = Proveedor("DeepSeek", "https://api.deepseek.com/chat/completions", "deepseek-chat")
+    private val OPENAI = Proveedor("OpenAI", "https://api.openai.com/v1/chat/completions", MODELO_OPENAI, true)
+    private val MISTRAL = Proveedor("Mistral", "https://api.mistral.ai/v1/chat/completions", "mistral-small-latest")
+
+    /** Devuelve el proveedor con formato «chat/completions» según la clave y el modelo, o null si toca Gemini. */
+    fun proveedorCompatible(clave: String, modelo: String): Proveedor? {
+        val k = clave.trim()
+        val m = modelo.trim().lowercase()
+        return when {
+            k.startsWith("sk-ant-") -> null
+            k.startsWith("nvapi-") -> NVIDIA
+            k.startsWith("gsk_") -> GROQ
+            k.startsWith("sk-or-") -> OPENROUTER
+            k.startsWith("xai-") -> XAI
+            k.startsWith("sk-") && m.startsWith("deepseek") -> DEEPSEEK
+            k.startsWith("sk-") -> OPENAI
+            m.startsWith("mistral") || m.startsWith("open-mistral") || m.startsWith("ministral") -> MISTRAL
+            else -> null
+        }
+    }
 
     fun preguntar(clave: String, modelo: String, texto: String, historial: JSONArray, notas: JSONArray): RespuestaIa {
         if (clave.isBlank()) throw ErrorIa("Falta la clave de IA (Gemini o Claude).")
@@ -52,8 +81,11 @@ donde action es none, follow, stay, jump o go_home."""
         for (intento in 0..2) {
             try {
                 return if (esClaude(clave)) preguntarClaude(clave.trim(), modelo, texto, historial, sistema)
-                else if (esOpenAI(clave)) preguntarOpenAI(clave.trim(), modelo, texto, historial, sistema)
-                else preguntarGemini(clave.trim(), modelo, texto, historial, sistema)
+                else {
+                    val prov = proveedorCompatible(clave, modelo)
+                    if (prov != null) preguntarCompatible(prov, clave.trim(), modelo, texto, historial, sistema)
+                    else preguntarGemini(clave.trim(), modelo, texto, historial, sistema)
+                }
             } catch (e: ErrorIa) {
                 if (!e.recuperable || intento == 2) throw e
                 ultimo = e
@@ -185,26 +217,31 @@ donde action es none, follow, stay, jump o go_home."""
         }
     }
 
-    // ---------------------------------------------------------------- OpenAI (ChatGPT)
+    // ---------------------------------------------------------------- OpenAI, NVIDIA, Groq, DeepSeek, etc.
 
-    private fun preguntarOpenAI(clave: String, modelo: String, texto: String, historial: JSONArray, sistema: String): RespuestaIa {
+    /** Todos estos proveedores hablan el mismo formato (chat/completions); solo cambian dirección, modelo y avisos. */
+    private fun preguntarCompatible(prov: Proveedor, clave: String, modelo: String, texto: String, historial: JSONArray, sistema: String): RespuestaIa {
+        val nombre = prov.nombre
         val m = modelo.trim().let {
-            if (it.isEmpty() || it.startsWith("gemini", ignoreCase = true) || it.startsWith("claude", ignoreCase = true)) MODELO_OPENAI else it
+            val ajeno = it.startsWith("gemini", ignoreCase = true) || it.startsWith("claude", ignoreCase = true) ||
+                (!prov.esOpenAI && it.startsWith("gpt", ignoreCase = true)) || (prov.esOpenAI && it.contains("/"))
+            if (it.isEmpty() || ajeno) prov.modelo else it
         }
         val msgs = JSONArray().put(JSONObject().put("role", "system").put("content", sistema))
         val previos = mensajesClaude(historial, texto)
         for (i in 0 until previos.length()) msgs.put(previos.getJSONObject(i))
-        val cuerpo = JSONObject()
-            .put("model", m)
-            .put("max_completion_tokens", 400)
-            .put("messages", msgs)
-            .put("response_format", JSONObject().put("type", "json_object"))
+        val cuerpo = JSONObject().put("model", m).put("messages", msgs)
+        if (prov.esOpenAI) {
+            cuerpo.put("max_completion_tokens", 400).put("response_format", JSONObject().put("type", "json_object"))
+        } else {
+            cuerpo.put("max_tokens", 400).put("temperature", 0.8)
+        }
 
-        val con = try { URL("https://api.openai.com/v1/chat/completions").openConnection() as HttpURLConnection } catch (e: Exception) { throw ErrorIa("No pude abrir la conexión con OpenAI.") }
+        val con = try { URL(prov.url).openConnection() as HttpURLConnection } catch (e: Exception) { throw ErrorIa("No pude abrir la conexión con $nombre.") }
         try {
             con.requestMethod = "POST"
             con.connectTimeout = 15000
-            con.readTimeout = 30000
+            con.readTimeout = 45000
             con.doOutput = true
             con.setRequestProperty("Content-Type", "application/json; charset=utf-8")
             con.setRequestProperty("Authorization", "Bearer $clave")
@@ -213,12 +250,13 @@ donde action es none, follow, stay, jump o go_home."""
             val codigo = con.responseCode
             val flujo = if (codigo in 200..299) con.inputStream else con.errorStream
             val crudo = flujo?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
-            if (codigo == 401) throw ErrorIa("La clave de OpenAI no es válida (401). Revísala y pégala de nuevo.")
-            if (codigo == 403) throw ErrorIa("OpenAI rechazó la clave o no tiene permiso (403).")
-            if (codigo == 404) throw ErrorIa("Ese modelo no existe (404). Pon «$MODELO_OPENAI» en el campo Modelo.")
-            if (codigo == 429) throw ErrorIa("OpenAI dice 429: te quedaste sin saldo o llegaste al límite. Revisa tus créditos en platform.openai.com.")
-            if (codigo == 500 || codigo == 502 || codigo == 503 || codigo == 504) throw ErrorIa("OpenAI está saturado ($codigo). No es tu clave.", true)
-            if (codigo !in 200..299) throw ErrorIa("OpenAI respondió $codigo. ${crudo.take(120)}")
+            if (codigo == 401) throw ErrorIa("La clave de $nombre no es válida (401). Revísala y pégala de nuevo.")
+            if (codigo == 402) throw ErrorIa("$nombre dice 402: no tienes saldo. Recarga créditos en su página.")
+            if (codigo == 403) throw ErrorIa("$nombre rechazó la clave o no tiene permiso (403).")
+            if (codigo == 404) throw ErrorIa("Ese modelo no existe (404). Pon «${prov.modelo}» en el campo Modelo.")
+            if (codigo == 429) throw ErrorIa("$nombre dice 429: sin saldo o límite por minuto alcanzado. Espera un momento o revisa tus créditos.")
+            if (codigo == 500 || codigo == 502 || codigo == 503 || codigo == 504) throw ErrorIa("$nombre está saturado ($codigo). No es tu clave.", true)
+            if (codigo !in 200..299) throw ErrorIa("$nombre respondió $codigo. ${crudo.take(120)}")
 
             val contenido = JSONObject(crudo).optJSONArray("choices")
                 ?.optJSONObject(0)?.optJSONObject("message")?.optString("content", "") ?: ""
@@ -230,11 +268,11 @@ donde action es none, follow, stay, jump o go_home."""
         } catch (e: UnknownHostException) {
             throw ErrorIa("Sin internet.")
         } catch (e: SocketTimeoutException) {
-            throw ErrorIa("OpenAI tardó demasiado en responder.", true)
+            throw ErrorIa("$nombre tardó demasiado en responder.", true)
         } catch (e: IOException) {
             throw ErrorIa("Error de red: ${e.message}", true)
         } catch (e: Exception) {
-            throw ErrorIa("Respuesta inesperada de OpenAI.")
+            throw ErrorIa("Respuesta inesperada de $nombre.")
         } finally {
             con.disconnect()
         }
@@ -296,11 +334,4 @@ donde action es none, follow, stay, jump o go_home."""
         val fin = t.lastIndexOf('}')
         val obj: JSONObject? =
             if (ini >= 0 && fin > ini) try { JSONObject(t.substring(ini, fin + 1)) } catch (_: Exception) { null } else null
-        if (obj == null || !obj.has("text")) return RespuestaIa(t.replace(Regex("\\s+"), " ").take(400), "none", null)
-        val texto = obj.optString("text", "").replace(Regex("\\s+"), " ").trim().take(400)
-        val accion = obj.optString("action", "none").let { if (it in ACCIONES) it else "none" }
-        val emocion = obj.optString("emotion", "calm").let { if (it in EMOCIONES) it else "calm" }
-        val recordar = if (obj.isNull("remember")) null else obj.optString("remember", "").trim().take(100).ifEmpty { null }
-        return RespuestaIa(texto, accion, recordar, emocion)
-    }
-}
+        if (obj
