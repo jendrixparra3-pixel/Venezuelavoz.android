@@ -1,0 +1,45 @@
+name: Venezuelavoz.android
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar codigo
+        uses: actions/checkout@v4
+
+      - name: Configurar Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Preparar estructura Android
+        run: |
+          mkdir -p app/src/main/java/com/venezuela/voz
+          mkdir -p app/src/main/res/drawable-nodpi
+          cp ./*.kt app/src/main/java/com/venezuela/voz/
+          cp AndroidManifest.xml app/src/main/AndroidManifest.xml
+          cp app_build.gradle.kts app/build.gradle.kts
+          cp venezuela_voz_profile.png app/src/main/res/drawable-nodpi/venezuela_voz_profile.png
+
+      - name: Configurar Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Configurar Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Compilar APK
+        run: gradle :app:assembleDebug --no-daemon
+
+      - name: Guardar APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: VenezuelaVoz-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
