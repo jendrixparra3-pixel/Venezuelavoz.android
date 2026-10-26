@@ -14,12 +14,13 @@ class ErrorIa(mensaje: String, val recuperable: Boolean = false) : Exception(men
 
 /**
  * Llama a la IA directo desde el teléfono con la clave que pegó el usuario.
- * La clave que empieza con «sk-ant-» usa Anthropic (Claude); cualquier otra usa Google (Gemini).
+ * La clave que empieza con «sk-ant-» usa Anthropic (Claude); la que empieza con «sk-» usa OpenAI (ChatGPT); cualquier otra usa Google (Gemini).
  * Errores temporales (500/502/503/504/529 y tiempos de espera) se reintentan hasta 2 veces con espera creciente.
  */
 object AiClient {
     const val MODELO_POR_DEFECTO = "gemini-flash-latest"
     const val MODELO_CLAUDE = "claude-haiku-5-5"
+    const val MODELO_OPENAI = "gpt-4o-mini"
     private val ACCIONES = setOf("none", "follow", "stay", "jump", "go_home")
     private val EMOCIONES = setOf("calm", "happy", "sad", "angry", "crying", "surprised", "proud")
 
@@ -38,6 +39,7 @@ Formato: responde SOLO con un JSON en una línea: {"text":"...","action":"none",
 donde action es none, follow, stay, jump o go_home."""
 
     fun esClaude(clave: String): Boolean = clave.trim().startsWith("sk-ant-")
+    fun esOpenAI(clave: String): Boolean = clave.trim().startsWith("sk-") && !esClaude(clave)
 
     fun preguntar(clave: String, modelo: String, texto: String, historial: JSONArray, notas: JSONArray): RespuestaIa {
         if (clave.isBlank()) throw ErrorIa("Falta la clave de IA (Gemini o Claude).")
@@ -50,6 +52,7 @@ donde action es none, follow, stay, jump o go_home."""
         for (intento in 0..2) {
             try {
                 return if (esClaude(clave)) preguntarClaude(clave.trim(), modelo, texto, historial, sistema)
+                else if (esOpenAI(clave)) preguntarOpenAI(clave.trim(), modelo, texto, historial, sistema)
                 else preguntarGemini(clave.trim(), modelo, texto, historial, sistema)
             } catch (e: ErrorIa) {
                 if (!e.recuperable || intento == 2) throw e
@@ -177,6 +180,61 @@ donde action es none, follow, stay, jump o go_home."""
             throw ErrorIa("Error de red: ${e.message}", true)
         } catch (e: Exception) {
             throw ErrorIa("Respuesta inesperada de Anthropic.")
+        } finally {
+            con.disconnect()
+        }
+    }
+
+    // ---------------------------------------------------------------- OpenAI (ChatGPT)
+
+    private fun preguntarOpenAI(clave: String, modelo: String, texto: String, historial: JSONArray, sistema: String): RespuestaIa {
+        val m = modelo.trim().let {
+            if (it.isEmpty() || it.startsWith("gemini", ignoreCase = true) || it.startsWith("claude", ignoreCase = true)) MODELO_OPENAI else it
+        }
+        val msgs = JSONArray().put(JSONObject().put("role", "system").put("content", sistema))
+        val previos = mensajesClaude(historial, texto)
+        for (i in 0 until previos.length()) msgs.put(previos.getJSONObject(i))
+        val cuerpo = JSONObject()
+            .put("model", m)
+            .put("max_completion_tokens", 400)
+            .put("messages", msgs)
+            .put("response_format", JSONObject().put("type", "json_object"))
+
+        val con = try { URL("https://api.openai.com/v1/chat/completions").openConnection() as HttpURLConnection } catch (e: Exception) { throw ErrorIa("No pude abrir la conexión con OpenAI.") }
+        try {
+            con.requestMethod = "POST"
+            con.connectTimeout = 15000
+            con.readTimeout = 30000
+            con.doOutput = true
+            con.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            con.setRequestProperty("Authorization", "Bearer $clave")
+            con.outputStream.use { it.write(cuerpo.toString().toByteArray(Charsets.UTF_8)) }
+
+            val codigo = con.responseCode
+            val flujo = if (codigo in 200..299) con.inputStream else con.errorStream
+            val crudo = flujo?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
+            if (codigo == 401) throw ErrorIa("La clave de OpenAI no es válida (401). Revísala y pégala de nuevo.")
+            if (codigo == 403) throw ErrorIa("OpenAI rechazó la clave o no tiene permiso (403).")
+            if (codigo == 404) throw ErrorIa("Ese modelo no existe (404). Pon «$MODELO_OPENAI» en el campo Modelo.")
+            if (codigo == 429) throw ErrorIa("OpenAI dice 429: te quedaste sin saldo o llegaste al límite. Revisa tus créditos en platform.openai.com.")
+            if (codigo == 500 || codigo == 502 || codigo == 503 || codigo == 504) throw ErrorIa("OpenAI está saturado ($codigo). No es tu clave.", true)
+            if (codigo !in 200..299) throw ErrorIa("OpenAI respondió $codigo. ${crudo.take(120)}")
+
+            val contenido = JSONObject(crudo).optJSONArray("choices")
+                ?.optJSONObject(0)?.optJSONObject("message")?.optString("content", "") ?: ""
+            val r = interpretar(contenido)
+            if (r.texto.isEmpty()) throw ErrorIa("La IA respondió vacío.")
+            return r
+        } catch (e: ErrorIa) {
+            throw e
+        } catch (e: UnknownHostException) {
+            throw ErrorIa("Sin internet.")
+        } catch (e: SocketTimeoutException) {
+            throw ErrorIa("OpenAI tardó demasiado en responder.", true)
+        } catch (e: IOException) {
+            throw ErrorIa("Error de red: ${e.message}", true)
+        } catch (e: Exception) {
+            throw ErrorIa("Respuesta inesperada de OpenAI.")
         } finally {
             con.disconnect()
         }
