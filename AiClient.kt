@@ -334,4 +334,12 @@ donde action es none, follow, stay, jump o go_home."""
         val fin = t.lastIndexOf('}')
         val obj: JSONObject? =
             if (ini >= 0 && fin > ini) try { JSONObject(t.substring(ini, fin + 1)) } catch (_: Exception) { null } else null
-        if (obj
+                if (obj == null) return RespuestaIa(t.replace(Regex("\\s+"), " ").take(400), "none", null)
+        if (!obj.has("text")) return RespuestaIa(t.replace(Regex("\\s+"), " ").take(400), "none", null)
+        val texto = obj.optString("text", "").replace(Regex("\\s+"), " ").trim().take(400)
+        val accion = obj.optString("action", "none").let { if (it in ACCIONES) it else "none" }
+        val emocion = obj.optString("emotion", "calm").let { if (it in EMOCIONES) it else "calm" }
+        val recordar = if (obj.isNull("remember")) null else obj.optString("remember", "").trim().take(100).ifEmpty { null }
+        return RespuestaIa(texto, accion, recordar, emocion)
+    }
+}
